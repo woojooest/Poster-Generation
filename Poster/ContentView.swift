@@ -158,9 +158,16 @@ struct ContentView: View {
     @ViewBuilder
     private func textEditor(for item: Binding<TextItem>) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            TextField("Text", text: item.text, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...4)
+            TextEditor(text: item.text)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color(nsColor: .separatorColor))
+                )
+                .frame(minHeight: 72)
 
             Picker("Font", selection: item.fontName) {
                 ForEach(FontCatalog.names, id: \.self) { Text($0).tag($0) }
@@ -296,8 +303,9 @@ struct TextLayerView: View {
     @ViewBuilder
     private var content: some View {
         if isEditing {
-            TextField("", text: $item.text, axis: .vertical)
-                .textFieldStyle(.plain)
+            TextEditor(text: $item.text)
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
                 .focused($focused)
                 .onAppear {
                     DispatchQueue.main.async {
@@ -307,7 +315,6 @@ struct TextLayerView: View {
                 .onChange(of: focused) { isFocused in
                     if !isFocused { onEndEdit() }
                 }
-                .onSubmit { onEndEdit() }
         } else {
             Text(item.text.isEmpty ? "Double-click to edit" : item.text)
                 .opacity(item.text.isEmpty ? 0.5 : 1)
