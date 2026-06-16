@@ -2,3 +2,5 @@ dist/
 build/
 .DS_Store
 xcuserdata/
+AGENTS.md
+build.sh
