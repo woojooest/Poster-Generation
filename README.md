@@ -1,25 +1,50 @@
 # Poster
 
-A tiny native macOS app for making simple posters for Instagram, RedNote, Weibo, and more.
+**A tiny native macOS app for making beautiful posters.**
 
-## Three steps
-1. **Pick a size** — presets for Instagram (square / portrait / story), RedNote, Weibo, X, and a print poster.
-2. **Pick a background color** — any color via the system color picker.
-3. **Add text** — choose the font, size, color, bold; drag the box to move it, and drag any of the four corners to resize. Text wraps inside the box, so the export matches the editor exactly.
+Pick a size, pick a color, add text — export as PNG. That's it.
 
-Then **Export PNG…** to save the poster at full pixel resolution.
+<p align="center">
+  <img src="docs/images/poster6.png" width="30%" />
+  <img src="docs/images/poster1.png" width="30%" />
+  <img src="docs/images/poster3.png" width="30%" />
+</p>
 
-## How to run
-1. Open `Poster.xcodeproj` in Xcode (15 or newer; requires macOS 13+).
-2. Select the **Poster** scheme and press **⌘R**.
+<p align="center">
+  <img src="docs/images/poster7.png" width="30%" />
+  <img src="docs/images/poster5.png" width="30%" />
+  <img src="docs/images/poster8.png" width="30%" />
+</p>
 
-## Build script
-- `./build.sh install` builds the release app and installs it to `/Applications`.
-- `./build.sh dmg` builds the release app and packages `dist/Poster.dmg`.
-- `./build.sh` defaults to `install`.
+## ✨ Features
 
-## Project layout
-- `Poster/PosterApp.swift` — app entry point
-- `Poster/ContentView.swift` — editor UI, canvas, and PNG export
-- `Poster/PosterCanvasView.swift` — pixel-accurate render used for export
-- `Poster/Models.swift` — size presets, font catalog, text model
+- **Preset sizes** — Instagram (square, portrait, story), RedNote (小红书), Weibo, X (Twitter), and print-ready A-series & US Letter
+- **Background color** — any color via the system color picker
+- **Rich text** — choose font, size, and color; bold supported. Drag to move, corner-drag to resize. Text wraps inside the box
+- **WYSIWYG export** — what you see in the editor is exactly what you get at full pixel resolution
+
+## 📥 Installation
+
+Go to **[Releases](https://github.com/woojooest/Poster-Generation/releases)** and download the latest `Poster.dmg`.
+
+- Open the DMG, drag **Poster** to your Applications folder, and you're done.
+- Requires macOS 13 or later.
+
+## 🎨 Showcase
+
+All posters above were created with Poster — inspired by David Hockney's bold, vibrant style.
+
+## 🛠 For Developers
+
+```bash
+# Clone and open in Xcode
+git clone git@github.com:woojooest/Poster-Generation.git
+cd Poster-Generation
+open Poster.xcodeproj
+```
+
+Requires Xcode 15+, macOS 13+.
+
+## 📄 License
+
+MIT
