@@ -494,90 +494,259 @@ struct TextLayerView: View {
     }
 }
 
-// MARK: - Selection chrome (resize handles)
+// MARK: - Native resize cursors
 
-/// One of the 8 resize handles, described by its normalized position on the
-/// box (fx / fy each ∈ {0, 0.5, 1}): corners use 0/1, edges use 0.5.
-struct ResizeHandle: Identifiable {
-    let id: Int
-    let fx: CGFloat
-    let fy: CGFloat
+extension NSCursor {
+    /// AppKit ships public ↔ and ↕ cursors but no public diagonal ones.
+    /// macOS draws window-frame corners with these long-stable private
+    /// cursors; we load them defensively and fall back if they ever vanish.
+    static let resizeNWSE: NSCursor = undocumented("_windowResizeNorthWestSouthEastCursor")
+        ?? .crosshair
+    static let resizeNESW: NSCursor = undocumented("_windowResizeNorthEastSouthWestCursor")
+        ?? .crosshair
 
-    static let all: [ResizeHandle] = [
-        ResizeHandle(id: 0, fx: 0,   fy: 0),
-        ResizeHandle(id: 1, fx: 0.5, fy: 0),
-        ResizeHandle(id: 2, fx: 1,   fy: 0),
-        ResizeHandle(id: 3, fx: 0,   fy: 0.5),
-        ResizeHandle(id: 4, fx: 1,   fy: 0.5),
-        ResizeHandle(id: 5, fx: 0,   fy: 1),
-        ResizeHandle(id: 6, fx: 0.5, fy: 1),
-        ResizeHandle(id: 7, fx: 1,   fy: 1)
-    ]
+    private static func undocumented(_ name: String) -> NSCursor? {
+        let sel = NSSelectorFromString(name)
+        guard NSCursor.responds(to: sel),
+              let value = NSCursor.perform(sel)?.takeUnretainedValue() as? NSCursor
+        else { return nil }
+        return value
+    }
 }
+
+// MARK: - Resize handle model
+
+/// The 8 resize handles on a selection's bounding box.
+enum HandlePos: CaseIterable, Hashable {
+    case topLeft, top, topRight, right, bottomRight, bottom, bottomLeft, left
+
+    /// Normalized x / y position on the box (0 = min edge, 0.5 = center, 1 = max edge).
+    var fx: CGFloat {
+        switch self {
+        case .topLeft, .left, .bottomLeft:    return 0
+        case .top, .bottom:                   return 0.5
+        case .topRight, .right, .bottomRight: return 1
+        }
+    }
+    var fy: CGFloat {
+        switch self {
+        case .topLeft, .top, .topRight:       return 0
+        case .left, .right:                   return 0.5
+        case .bottomLeft, .bottom, .bottomRight: return 1
+        }
+    }
+
+    /// Which edges this handle drags (rule 7).
+    var movesLeft: Bool   { fx == 0 }
+    var movesRight: Bool  { fx == 1 }
+    var movesTop: Bool    { fy == 0 }
+    var movesBottom: Bool { fy == 1 }
+
+    /// Native directional cursor (rule 4).
+    var cursor: NSCursor {
+        switch self {
+        case .left, .right:                   return .resizeLeftRight   // ew-resize
+        case .top, .bottom:                   return .resizeUpDown      // ns-resize
+        case .topLeft, .bottomRight:          return .resizeNWSE        // nwse-resize
+        case .topRight, .bottomLeft:          return .resizeNESW        // nesw-resize
+        }
+    }
+}
+
+/// A handle placed in screen (display/canvas) space.
+struct PlacedHandle: Identifiable {
+    let pos: HandlePos
+    let center: CGPoint
+    var id: HandlePos { pos }
+}
+
+// MARK: - Pure geometry helpers (decomposed per rule 10)
+
+/// Handle centers in screen space. Edges come first and corners last so that
+/// when rendered/hit-tested in order the corners sit on top — on a small box
+/// (where corner and edge hit areas overlap) the corner wins.
+func getResizeHandles(_ box: CGRect) -> [PlacedHandle] {
+    let order: [HandlePos] = [.top, .right, .bottom, .left,
+                              .topLeft, .topRight, .bottomLeft, .bottomRight]
+    return order.map { pos in
+        PlacedHandle(pos: pos,
+                     center: CGPoint(x: box.minX + pos.fx * box.width,
+                                     y: box.minY + pos.fy * box.height))
+    }
+}
+
+/// First handle whose hit circle contains `point` (screen space). Returns the
+/// highest-priority match because `handles` is corner-first ordered.
+func hitTestResizeHandle(_ point: CGPoint,
+                         _ handles: [PlacedHandle],
+                         hitRadius: CGFloat) -> HandlePos? {
+    for h in handles where hypot(point.x - h.center.x, point.y - h.center.y) <= hitRadius {
+        return h.pos
+    }
+    return nil
+}
+
+/// New rect from a drag, in world (poster) space. Only the edges the handle
+/// owns move; the opposite edge is anchored. Enforces min width / height (rule 8).
+func resizeRectByHandle(startRect b: CGRect,
+                        handle: HandlePos,
+                        dx: CGFloat,
+                        dy: CGFloat,
+                        minW: CGFloat,
+                        minH: CGFloat) -> CGRect {
+    var minX = b.minX, maxX = b.maxX, minY = b.minY, maxY = b.maxY
+
+    if handle.movesLeft   { minX += dx }
+    if handle.movesRight  { maxX += dx }
+    if handle.movesTop    { minY += dy }
+    if handle.movesBottom { maxY += dy }
+
+    if maxX - minX < minW {
+        if handle.movesLeft { minX = maxX - minW } else { maxX = minX + minW }
+    }
+    if maxY - minY < minH {
+        if handle.movesTop { minY = maxY - minH } else { maxY = minY + minH }
+    }
+
+    return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+}
+
+// MARK: - Selection chrome (macOS-style resizable frame)
 
 struct SelectionOverlay: View {
     @Binding var item: TextItem
     let scale: CGFloat
     let canvasSize: CGSize
 
-    @State private var baseline: CGRect?
-    private let minBox: CGFloat = 40
-    private let handle: CGFloat = 10
+    /// Explicit interaction state machine (rule 11).
+    private enum Interaction: Equatable {
+        case idle
+        case hoverResizeHandle(HandlePos)
+        case resizing(HandlePos)
+    }
+
+    @State private var interaction: Interaction = .idle
+    @State private var resizeStartRect: CGRect?     // world space, captured on pointer-down
+
+    // Screen-space sizing — looks constant regardless of canvas scale (rule 9).
+    private let visualRadius: CGFloat = 5           // 10px circle
+    private let hitRadius: CGFloat = 11             // generous hit area (rule 2)
+
+    /// Selection box in display (canvas) space.
+    private var displayBox: CGRect {
+        CGRect(x: item.rect.minX * scale,
+               y: item.rect.minY * scale,
+               width: item.size.width * scale,
+               height: item.size.height * scale)
+    }
 
     var body: some View {
-        // Box rect in display (canvas) coordinates.
-        let dr = CGRect(x: item.rect.minX * scale,
-                        y: item.rect.minY * scale,
-                        width: item.size.width * scale,
-                        height: item.size.height * scale)
+        let box = displayBox
+        let handles = getResizeHandles(box)
 
         ZStack(alignment: .topLeading) {
+            // Bounding box outline — never hittable, so it can't block moving.
             Rectangle()
                 .strokeBorder(Color.accentColor.opacity(0.9), lineWidth: 1)
-                .frame(width: dr.width, height: dr.height)
-                .position(x: dr.midX, y: dr.midY)
+                .frame(width: box.width, height: box.height)
+                .position(x: box.midX, y: box.midY)
                 .allowsHitTesting(false)
 
-            ForEach(ResizeHandle.all) { h in
-                Circle()
-                    .fill(Color.white)
-                    .overlay(Circle().strokeBorder(Color.black.opacity(0.18), lineWidth: 0.5))
-                    .shadow(color: .black.opacity(0.3), radius: 1.5, x: 0, y: 0.5)
-                    .frame(width: handle, height: handle)
-                    .contentShape(Circle().inset(by: -6))
-                    .position(x: dr.minX + h.fx * dr.width,
-                              y: dr.minY + h.fy * dr.height)
-                    .gesture(resizeDrag(h))
+            // One small interactive view per handle. Only these tiny circles are
+            // hittable; the rest of the box stays transparent to input, so drags
+            // on the body fall through to the text layer underneath for moving.
+            // Corners are last in `handles`, so they render/hit on top of edges
+            // where the hit areas overlap on a small box.
+            ForEach(handles) { h in
+                renderHandle(h)
             }
         }
         .frame(width: canvasSize.width, height: canvasSize.height, alignment: .topLeading)
     }
 
-    private func resizeDrag(_ h: ResizeHandle) -> some Gesture {
-        DragGesture()
-            .onChanged { value in
-                if baseline == nil { baseline = item.rect }
-                guard let b = baseline else { return }
+    // MARK: Rendering (renderSelectionBox per rule 10)
 
+    @ViewBuilder
+    private func renderHandle(_ h: PlacedHandle) -> some View {
+        let activeOrHover: HandlePos? = {
+            switch interaction {
+            case .resizing(let p), .hoverResizeHandle(let p): return p
+            case .idle: return nil
+            }
+        }()
+        let emphasized = (h.pos == activeOrHover)
+
+        Circle()
+            .fill(Color.white)
+            .overlay(Circle().strokeBorder(Color.black.opacity(0.18), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.3), radius: 1.5, x: 0, y: 0.5)
+            .frame(width: visualRadius * 2 * (emphasized ? 1.3 : 1),
+                   height: visualRadius * 2 * (emphasized ? 1.3 : 1))
+            // Fixed hit footprint, larger than the dot, so you don't need pixel
+            // accuracy. Hover + gesture attach HERE, to this small view…
+            .frame(width: hitRadius * 2, height: hitRadius * 2)
+            .contentShape(Circle())
+            .onContinuousHover { phase in hover(phase, on: h.pos) }
+            .gesture(resizeGesture(h.pos))
+            // …and `.position` is applied LAST. (Applying it earlier makes the
+            // view greedy/full-canvas, so its hover+gesture would cover the whole
+            // canvas and only the top-most handle would ever be hit.)
+            .position(x: h.center.x, y: h.center.y)
+    }
+
+    // MARK: Hover (cursor on move — rules 3, 4 & 12)
+
+    private func hover(_ phase: HoverPhase, on pos: HandlePos) {
+        // While resizing, direction & cursor are locked — ignore hover (rule 6).
+        if case .resizing = interaction { return }
+
+        switch phase {
+        case .active:
+            interaction = .hoverResizeHandle(pos)
+            pos.cursor.set()                       // native resize cursor
+        case .ended:
+            // Only reset if we're still the handle that set the hover state —
+            // avoids a stale exit clobbering an adjacent handle we just entered.
+            if interaction == .hoverResizeHandle(pos) {
+                interaction = .idle
+                NSCursor.arrow.set()
+            }
+        }
+    }
+
+    // MARK: Resize drag (startResize / updateResize / endResize — rule 10)
+
+    private func resizeGesture(_ handle: HandlePos) -> some Gesture {
+        // Measure in `.global` (a stable space). The default `.local` space is
+        // tied to the handle, which moves as the box resizes — that feedback
+        // makes the translation oscillate and the text/box jitter.
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+            .onChanged { value in
+                if case .resizing = interaction {
+                    // already started — handle stays locked (rule 6)
+                } else {
+                    // startResize: capture the starting rect once.
+                    resizeStartRect = item.rect                      // world space
+                    interaction = .resizing(handle)
+                }
+
+                handle.cursor.set()             // hold the cursor through the whole drag
+
+                // updateResize: screen-space delta → world space (rule 9).
+                guard let start = resizeStartRect else { return }
                 let dx = value.translation.width / scale
                 let dy = value.translation.height / scale
-
-                // Move only the edges this handle controls.
-                let minX = (h.fx == 0)   ? b.minX + dx : b.minX
-                let maxX = (h.fx == 1)   ? b.maxX + dx : b.maxX
-                let minY = (h.fy == 0)   ? b.minY + dy : b.minY
-                let maxY = (h.fy == 1)   ? b.maxY + dy : b.maxY
-
-                let w = max(minBox, maxX - minX)
-                let hgt = max(minBox, maxY - minY)
-                // Anchor the opposite edge so it stays put.
-                let originX = (h.fx == 0) ? maxX - w : minX
-                let originY = (h.fy == 0) ? maxY - hgt : minY
-
-                item.position = CGPoint(x: originX + w / 2, y: originY + hgt / 2)
-                item.size = CGSize(width: w, height: hgt)
+                let r = resizeRectByHandle(startRect: start, handle: handle,
+                                           dx: dx, dy: dy, minW: 20, minH: 20)
+                item.size = CGSize(width: r.width, height: r.height)
+                item.position = CGPoint(x: r.midX, y: r.midY)
             }
-            .onEnded { _ in baseline = nil }
+            .onEnded { _ in
+                // endResize: leave resizing mode, resume normal hit testing.
+                resizeStartRect = nil
+                interaction = .idle
+                NSCursor.arrow.set()
+            }
     }
 }
 
