@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var items: [TextItem] = []
     @State private var selectedID: UUID?
     @State private var editingID: UUID?
+    @State private var activeGuides = SmartGuides()
 
     // Last hovered point on the poster, in poster coordinates (for "Add Text here").
     @State private var hoverPoint: CGPoint?
@@ -51,16 +52,22 @@ struct ContentView: View {
                     .onTapGesture {
                         selectedID = nil
                         editingID = nil
+                        activeGuides = SmartGuides()
                     }
 
                 ForEach($items) { $item in
                     TextLayerView(item: $item,
                                   scale: scale,
+                                  canvasSize: posterSize,
                                   isEditing: editingID == item.id,
                                   onSelect: { selectedID = item.id },
                                   onBeginEdit: { selectedID = item.id; editingID = item.id },
-                                  onEndEdit: { if editingID == item.id { editingID = nil } })
+                                  onEndEdit: { if editingID == item.id { editingID = nil } },
+                                  onGuidesChanged: { activeGuides = $0 })
                 }
+
+                renderSmartGuides(guides: activeGuides,
+                                  canvasSize: CGSize(width: dispW, height: dispH))
 
                 if editingID == nil, let sel = selectedBinding {
                     SelectionOverlay(item: sel,
@@ -262,17 +269,150 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Smart guides + snapping
+
+struct ComponentBounds {
+    let left: CGFloat
+    let right: CGFloat
+    let top: CGFloat
+    let bottom: CGFloat
+    let centerX: CGFloat
+    let centerY: CGFloat
+
+    init(position: CGPoint, size: CGSize) {
+        left = position.x - size.width / 2
+        right = position.x + size.width / 2
+        top = position.y - size.height / 2
+        bottom = position.y + size.height / 2
+        centerX = position.x
+        centerY = position.y
+    }
+}
+
+struct SmartGuides: Equatable {
+    var verticalCenter = false
+    var horizontalCenter = false
+}
+
+struct SnapState {
+    var x = false
+    var y = false
+}
+
+struct SnapResult {
+    let position: CGPoint
+    let guides: SmartGuides
+    let state: SnapState
+    let enteredX: Bool
+    let enteredY: Bool
+}
+
+private let enterSnapThreshold: CGFloat = 8
+private let exitSnapThreshold: CGFloat = 14
+
+func calculateSnap(position: CGPoint,
+                   componentSize: CGSize,
+                   canvasSize: CGSize,
+                   scale: CGFloat,
+                   previousState: SnapState) -> SnapResult {
+    let worldEnterThreshold = enterSnapThreshold / scale
+    let worldExitThreshold = exitSnapThreshold / scale
+    let bounds = ComponentBounds(position: position, size: componentSize)
+    let canvasCenterX = canvasSize.width / 2
+    let canvasCenterY = canvasSize.height / 2
+
+    var snappedPosition = position
+    var nextState = previousState
+    var guides = SmartGuides()
+    var enteredX = false
+    var enteredY = false
+
+    let dx = bounds.centerX - canvasCenterX
+    if previousState.x {
+        if abs(dx) > worldExitThreshold {
+            nextState.x = false
+        } else {
+            snappedPosition.x = canvasCenterX
+            guides.verticalCenter = true
+        }
+    } else if abs(dx) < worldEnterThreshold {
+        nextState.x = true
+        enteredX = true
+        snappedPosition.x = canvasCenterX
+        guides.verticalCenter = true
+    }
+
+    let dy = bounds.centerY - canvasCenterY
+    if previousState.y {
+        if abs(dy) > worldExitThreshold {
+            nextState.y = false
+        } else {
+            snappedPosition.y = canvasCenterY
+            guides.horizontalCenter = true
+        }
+    } else if abs(dy) < worldEnterThreshold {
+        nextState.y = true
+        enteredY = true
+        snappedPosition.y = canvasCenterY
+        guides.horizontalCenter = true
+    }
+
+    return SnapResult(position: snappedPosition,
+                      guides: guides,
+                      state: nextState,
+                      enteredX: enteredX,
+                      enteredY: enteredY)
+}
+
+func applySnapping(position: CGPoint,
+                   componentSize: CGSize,
+                   canvasSize: CGSize,
+                   scale: CGFloat,
+                   state: inout SnapState) -> SnapResult {
+    let result = calculateSnap(position: position,
+                               componentSize: componentSize,
+                               canvasSize: canvasSize,
+                               scale: scale,
+                               previousState: state)
+    state = result.state
+    return result
+}
+
+@ViewBuilder
+func renderSmartGuides(guides: SmartGuides, canvasSize: CGSize) -> some View {
+    ZStack {
+        if guides.verticalCenter {
+            Rectangle()
+                .fill(Color.accentColor.opacity(0.85))
+                .frame(width: 1, height: canvasSize.height)
+                .position(x: canvasSize.width / 2, y: canvasSize.height / 2)
+        }
+
+        if guides.horizontalCenter {
+            Rectangle()
+                .fill(Color.accentColor.opacity(0.85))
+                .frame(width: canvasSize.width, height: 1)
+                .position(x: canvasSize.width / 2, y: canvasSize.height / 2)
+        }
+    }
+    .frame(width: canvasSize.width, height: canvasSize.height)
+    .allowsHitTesting(false)
+}
+
 // MARK: - Text layer (display + move)
 
 struct TextLayerView: View {
     @Binding var item: TextItem
     let scale: CGFloat
+    let canvasSize: CGSize
     let isEditing: Bool
     let onSelect: () -> Void
     let onBeginEdit: () -> Void
     let onEndEdit: () -> Void
+    let onGuidesChanged: (SmartGuides) -> Void
 
     @State private var moveBaseline: CGPoint?
+    @State private var snapState = SnapState()
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -326,15 +466,31 @@ struct TextLayerView: View {
             .onChanged { value in
                 if moveBaseline == nil {
                     moveBaseline = item.position
+                    snapState = SnapState()
                     onSelect()
                 }
                 if let base = moveBaseline {
-                    item.position = CGPoint(
+                    let rawPosition = CGPoint(
                         x: base.x + value.translation.width / scale,
                         y: base.y + value.translation.height / scale)
+                    let snap = applySnapping(position: rawPosition,
+                                             componentSize: item.size,
+                                             canvasSize: canvasSize,
+                                             scale: scale,
+                                             state: &snapState)
+                    item.position = snap.position
+                    onGuidesChanged(snap.guides)
+                    if snap.enteredX || snap.enteredY {
+                        NSHapticFeedbackManager.defaultPerformer.perform(.alignment,
+                                                                          performanceTime: .now)
+                    }
                 }
             }
-            .onEnded { _ in moveBaseline = nil }
+            .onEnded { _ in
+                moveBaseline = nil
+                snapState = SnapState()
+                onGuidesChanged(SmartGuides())
+            }
     }
 }
 
